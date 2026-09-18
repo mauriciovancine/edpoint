@@ -1,49 +1,38 @@
 # ------------------------------------------------------------------
 # Occurrence Points Editor
-# A Shiny app to inspect, clean and export occurrence records (lat/lon).
-#
-# To run:
-#   install.packages(c("shiny","bslib","leaflet","leaflet.extras","DT","dplyr"))
-#   shiny::runApp("app.R")
 # ------------------------------------------------------------------
 
-pkgs <- c("shiny", "bslib", "leaflet", "leaflet.extras", "DT", "dplyr", "curl")
+# 1. PACOTES -------------------------------------------------------
+pkgs <- c("shiny", "bslib", "leaflet", "DT", "dplyr")
 missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing)) {
-    stop("Please install: install.packages(c('",
-         paste(missing, collapse = "','"), "'))")
+    stop("Por favor instale: install.packages(c('", paste(missing, collapse = "','"), "'))")
 }
 
 library(shiny)
 library(bslib)
 library(leaflet)
-library(leaflet.extras)
 library(DT)
 library(dplyr)
 
-options(shiny.maxRequestSize = 100 * 1024^2,
-        timeout = 1e3)  # uploads up to 100 MB
+HAS_DRAW_TOOLS <- requireNamespace("leaflet.extras", quietly = TRUE)
+if (HAS_DRAW_TOOLS) library(leaflet.extras)
 
-ZOOM_LEVEL <- 16  # zoom applied when centering on a selected point
+options(shiny.maxRequestSize = 100 * 1024^2)
+ZOOM_LEVEL <- 16
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-# Make sure the required internal columns exist
+# 2. FUNÇÕES AUXILIARES --------------------------------------------
 standardize <- function(df, col_lon, col_lat) {
     names(df)[names(df) == col_lon] <- "longitude"
     names(df)[names(df) == col_lat] <- "latitude"
     df$longitude <- suppressWarnings(as.numeric(df$longitude))
     df$latitude  <- suppressWarnings(as.numeric(df$latitude))
     if (!"status" %in% names(df)) df$status <- "unreviewed"
-    if (!"notes"  %in% names(df)) df$notes  <- NA_character_
     df$id <- seq_len(nrow(df))
-    others <- setdiff(names(df), c("id", "longitude", "latitude", "status", "notes"))
-    df[, c("id", "longitude", "latitude", "status", "notes", others), drop = FALSE]
+    others <- setdiff(names(df), c("id", "longitude", "latitude", "status"))
+    df[, c("id", "longitude", "latitude", "status", others), drop = FALSE]
 }
 
-# Row-by-row diagnostics ("" means no issue found)
 validate_rows <- function(df) {
     n <- nrow(df)
     if (n == 0) return(character(0))
@@ -64,7 +53,6 @@ validate_rows <- function(df) {
     }, character(1))
 }
 
-# Sample data with deliberate errors, for testing
 sample_data <- function() {
     set.seed(42)
     n <- 30
@@ -75,20 +63,32 @@ sample_data <- function() {
         year      = sample(1990:2024, n, TRUE),
         stringsAsFactors = FALSE
     )
-    df$longitude[2] <- 0; df$latitude[2] <- 0                               # null island
-    df$latitude[5]  <- 95                                                   # out of range
-    df[10, c("longitude", "latitude")] <- df[9, c("longitude", "latitude")] # duplicate
-    df$longitude[12] <- NA                                                  # missing
+    df$longitude[2] <- 0; df$latitude[2] <- 0
+    df$latitude[5]  <- 95
+    df[10, c("longitude", "latitude")] <- df[9, c("longitude", "latitude")]
+    df$longitude[12] <- NA
     df
 }
 
 marker_color <- function(issue, status) {
     ifelse(status == "incorrect", "red",
            ifelse(status == "correct", "green",
-                  ifelse(nzchar(issue), "red", "blue")))
+                  ifelse(nzchar(issue), "red", "gray50")))
 }
 
-# Point-in-polygon test (PNPOLY algorithm), vectorized over points
+# Desenha um alfinete (Pin) em SVG codificado em Data URI para o Leaflet
+svg_pin <- function(color) {
+    color <- gsub("#", "%23", color) 
+    svg <- paste0(
+        "data:image/svg+xml;charset=UTF-8,",
+        "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='32' height='32'%3E",
+        "%3Cpath d='M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z' ",
+        "fill='", color, "' stroke='white' stroke-width='1'/%3E",
+        "%3C/svg%3E"
+    )
+    return(svg)
+}
+
 point_in_polygon <- function(px, py, poly_x, poly_y) {
     n <- length(poly_x)
     inside <- rep(FALSE, length(px))
@@ -105,14 +105,10 @@ point_in_polygon <- function(px, py, poly_x, poly_y) {
     inside
 }
 
-# ------------------------------------------------------------------
-# UI
-# ------------------------------------------------------------------
-
+# 3. INTERFACE (UI) ------------------------------------------------
 ui <- page_sidebar(
     title = "Occurrence Points Editor",
-    theme = bs_theme(version = 5,
-                     preset = "shiny",
+    theme = bs_theme(version = 5, preset = "shiny",
                      primary = "#2563eb", 
                      success = "#2ecc71", 
                      danger = "#e74c3c",
@@ -150,17 +146,11 @@ ui <- page_sidebar(
                 "Actions", icon = icon("pen-to-square"),
                 actionButton("mark_ok", "Mark as correct", class = "btn-success w-100 mb-2"),
                 actionButton("mark_bad", "Mark as incorrect", class = "btn-danger w-100 mb-2"),
+                actionButton("undo", "Mark as unreviewed", class = "btn-secondary w-100 mb-2"),
                 actionButton("zoom", "Zoom to selection", class = "btn-primary w-100 mb-2"),
-                actionButton("undo", "Undo", class = "btn-secondary w-100 mb-2"),
+                actionButton("select_all", "Select all", class = "btn-outline-secondary w-100 mb-2"),
                 actionButton("deselect_all", "Deselect all", class = "btn-outline-secondary w-100 mb-2"),
                 checkboxInput("needs_fix", "Show only records that still need correction", FALSE)
-            ),
-            
-            accordion_panel(
-                "Notes", icon = icon("note-sticky"),
-                helpText("Select a single row in the table to edit its note here."),
-                textAreaInput("notes_box", NULL, rows = 4, placeholder = "No row selected"),
-                actionButton("save_notes", "Save note", class = "btn-primary w-100")
             ),
             
             accordion_panel(
@@ -181,19 +171,12 @@ ui <- page_sidebar(
     )
 )
 
-# ------------------------------------------------------------------
-# Server
-# ------------------------------------------------------------------
-
+# 4. SERVIDOR (SERVER) ---------------------------------------------
 server <- function(input, output, session) {
     
     rv <- reactiveValues(
-        df = data.frame(id = integer(0),
-                        longitude = numeric(0), 
-                        latitude = numeric(0),
-                        status = character(0), 
-                        notes = character(0),
-                        stringsAsFactors = FALSE),
+        df = data.frame(id = integer(0), longitude = numeric(0), latitude = numeric(0),
+                        status = character(0), stringsAsFactors = FALSE),
         history = list(),
         raw = NULL,
         pinned_id = NULL
@@ -203,13 +186,9 @@ server <- function(input, output, session) {
         rv$history <- utils::head(c(list(rv$df), rv$history), 20)
     }
     
-    # ---- file input ---------------------------------------------------------
     observeEvent(input$file, {
-        rv$raw <- utils::read.csv(input$file$datapath, 
-                                  sep = input$sep,
-                                  dec = input$dec,
-                                  stringsAsFactors = FALSE, 
-                                  check.names = TRUE)
+        rv$raw <- utils::read.csv(input$file$datapath, sep = input$sep, dec = input$dec,
+                                  stringsAsFactors = FALSE, check.names = TRUE)
     })
     
     output$coord_pickers <- renderUI({
@@ -231,20 +210,17 @@ server <- function(input, output, session) {
             showNotification("Longitude and latitude must be different columns.", type = "error")
             return()
         }
-        snapshot()
         rv$df <- standardize(rv$raw, input$col_lon, input$col_lat)
         rv$pinned_id <- NULL
         showNotification(paste(nrow(rv$df), "records loaded."), type = "message")
     })
     
     observeEvent(input$demo, {
-        snapshot()
         rv$df <- standardize(sample_data(), "longitude", "latitude")
         rv$pinned_id <- NULL
         showNotification("Sample data loaded.", type = "message")
     })
     
-    # ---- derived data -------------------------------------------------------
     df_diag <- reactive({
         d <- rv$df
         if (nrow(d) == 0) return(cbind(d, issue = character(0)))
@@ -270,36 +246,50 @@ server <- function(input, output, session) {
         if (is.null(sel) || nrow(d) == 0) integer(0) else d$id[sel]
     })
     
-    # ---- map ----------------------------------------------------------------
     output$map <- renderLeaflet({
-        leaflet() |>
+        m <- leaflet() |>
             addProviderTiles(providers$OpenStreetMap, group = "Street") |>
             addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") |>
             addLayersControl(baseGroups = c("Street", "Satellite"),
-                             options = layersControlOptions(collapsed = TRUE)) |>
-            addDrawToolbar(
+                             options = layersControlOptions(collapsed = TRUE))
+        if (HAS_DRAW_TOOLS) {
+            m <- m |> leaflet.extras::addDrawToolbar(
                 targetGroup = "drawnPoly",
                 polylineOptions = FALSE, circleOptions = FALSE, circleMarkerOptions = FALSE,
                 markerOptions = FALSE,
-                rectangleOptions = drawRectangleOptions(),
-                polygonOptions = drawPolygonOptions(),
-                editOptions = editToolbarOptions(edit = FALSE, remove = TRUE)
-            ) |>
-            setView(lng = -50, lat = -15, zoom = 4)
+                rectangleOptions = leaflet.extras::drawRectangleOptions(),
+                polygonOptions = leaflet.extras::drawPolygonOptions(),
+                editOptions = leaflet.extras::editToolbarOptions(edit = FALSE, remove = TRUE)
+            )
+        }
+        m |> setView(lng = -50, lat = -15, zoom = 4)
     })
     
     observe({
         d <- df_visible()
         sel_ids <- selected_ids()
         proxy <- leafletProxy("map") |> clearGroup("points") |> clearGroup("highlight")
+        
         ok <- d[!is.na(d$longitude) & !is.na(d$latitude) &
                     abs(d$longitude) <= 180 & abs(d$latitude) <= 90, ]
+        
         if (nrow(ok) == 0) return()
-        icons <- awesomeIcons(icon = "map-marker", library = "fa", iconColor = "#ffffff",
-                              markerColor = marker_color(ok$issue, ok$status))
-        proxy |> addAwesomeMarkers(
+        
+        # Gera os ícones SVG dinâmicos no formato de alfinete (pin)
+        colors <- marker_color(ok$issue, ok$status)
+        pin_urls <- vapply(colors, svg_pin, character(1), USE.NAMES = FALSE)
+        
+        my_icons <- icons(
+            iconUrl = pin_urls,
+            iconWidth = 32, iconHeight = 32,
+            iconAnchorX = 16, iconAnchorY = 32,
+            popupAnchorX = 0, popupAnchorY = -32
+        )
+        
+        proxy |> addMarkers(
             lng = ok$longitude, lat = ok$latitude,
-            layerId = as.character(ok$id), icon = icons, group = "points",
+            layerId = as.character(ok$id), group = "points",
+            icon = my_icons,
             label = paste0("id ", ok$id),
             popup = paste0("<b>id ", ok$id, "</b><br>",
                            "lon: ", round(ok$longitude, 5),
@@ -307,6 +297,7 @@ server <- function(input, output, session) {
                            ifelse(nzchar(ok$issue),
                                   paste0("<br><span style='color:red'>", ok$issue, "</span>"), ""))
         )
+        
         sel <- ok[ok$id %in% sel_ids, ]
         if (nrow(sel) > 0) {
             proxy |> addCircleMarkers(
@@ -316,15 +307,14 @@ server <- function(input, output, session) {
         }
     })
     
-    # click a marker -> bring the matching row to the top of the table and select it
     observeEvent(input$map_marker_click, {
         id <- suppressWarnings(as.integer(input$map_marker_click$id))
         req(!is.na(id))
         rv$pinned_id <- id
     })
     
-    # draw a polygon/rectangle on the map -> select every point that falls inside it
     observeEvent(input$map_draw_new_feature, {
+        req(HAS_DRAW_TOOLS)
         feat <- input$map_draw_new_feature
         req(identical(feat$geometry$type, "Polygon"))
         ring <- feat$geometry$coordinates[[1]]
@@ -352,7 +342,6 @@ server <- function(input, output, session) {
         }
     })
     
-    # ---- table --------------------------------------------------------------
     output$table <- renderDT({
         d <- df_visible()
         datatable(
@@ -390,7 +379,6 @@ server <- function(input, output, session) {
         rv$df[i, column] <- value
     })
     
-    # ---- actions on the selection ------------------------------------------
     set_status <- function(new_status) {
         ids <- selected_ids()
         if (!length(ids)) {
@@ -399,32 +387,23 @@ server <- function(input, output, session) {
         snapshot()
         rv$df$status[rv$df$id %in% ids] <- new_status
     }
-    # ---- notes editor ---------------------------------------------------------
-    observeEvent(selected_ids(), {
-        ids <- selected_ids()
-        if (length(ids) == 1) {
-            current <- rv$df$notes[rv$df$id == ids]
-            updateTextAreaInput(session, "notes_box", value = ifelse(is.na(current), "", current),
-                                placeholder = NULL)
-        } else {
-            updateTextAreaInput(session, "notes_box", value = "",
-                                placeholder = if (length(ids) == 0) "No row selected"
-                                else "Select a single row to edit its note")
-        }
-    }, ignoreNULL = FALSE)
-    
-    observeEvent(input$save_notes, {
-        ids <- selected_ids()
-        if (length(ids) != 1) {
-            showNotification("Select exactly one row to save a note.", type = "warning"); return()
-        }
-        snapshot()
-        rv$df$notes[rv$df$id == ids] <- input$notes_box
-        showNotification("Note saved.", type = "message")
-    })
     
     observeEvent(input$mark_ok,  set_status("correct"))
     observeEvent(input$mark_bad, set_status("incorrect"))
+    observeEvent(input$undo,     set_status("unreviewed"))
+    
+    observeEvent(input$select_all, {
+        rv$pinned_id <- NULL
+        n_rows <- nrow(df_visible())
+        if (n_rows > 0) {
+            DT::selectRows(DT::dataTableProxy("table"), seq_len(n_rows))
+        }
+    })
+    
+    observeEvent(input$deselect_all, {
+        rv$pinned_id <- NULL
+        DT::selectRows(DT::dataTableProxy("table"), NULL)
+    })
     
     observeEvent(input$zoom, {
         ids <- selected_ids()
@@ -442,26 +421,11 @@ server <- function(input, output, session) {
         }
     })
     
-    # zoom straight in when a marker is clicked
     observeEvent(input$map_marker_click, {
         ev <- input$map_marker_click
         leafletProxy("map") |> setView(ev$lng, ev$lat, zoom = ZOOM_LEVEL)
     })
     
-    observeEvent(input$undo, {
-        if (!length(rv$history)) {
-            showNotification("Nothing to undo.", type = "warning"); return()
-        }
-        rv$df <- rv$history[[1]]
-        rv$history <- rv$history[-1]
-    })
-    
-    observeEvent(input$deselect_all, {
-        rv$pinned_id <- NULL
-        DT::selectRows(DT::dataTableProxy("table"), NULL)
-    })
-    
-    # ---- download -----------------------------------------------------------
     output$download <- downloadHandler(
         filename = function() paste0("occurrences_edited_", Sys.Date(), ".csv"),
         content = function(file) {
@@ -470,4 +434,5 @@ server <- function(input, output, session) {
     )
 }
 
-shinyApp(ui, server)
+# 5. EXECUÇÃO DO APP -----------------------------------------------
+shinyApp(ui = ui, server = server)
